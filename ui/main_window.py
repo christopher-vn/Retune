@@ -632,12 +632,14 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QProgressDialog
         path, _ = QFileDialog.getSaveFileName(
             self, self.t("save_dialog_title"), "",
-            self.t("save_dialog_filter")
+            "MP3 (*.mp3);;WAV (*.wav)"
         )
         if not path:
             return
-        if not path.endswith(".wav"):
-            path += ".wav"
+
+        # Ensure correct extension based on selected filter.
+        if not path.endswith(".mp3") and not path.endswith(".wav"):
+            path += ".mp3"
 
         was_playing = self.player.is_playing()
         if was_playing:
