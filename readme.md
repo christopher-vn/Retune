@@ -1,10 +1,12 @@
 # Retune
 
 A desktop audio player focused on real-time pitch and tempo control.
+Built for musicians, transcribers, and anyone who works with audio on a computer.
 
 ---
 
 Десктопный аудиоплеер с управлением тональностью и темпом в реальном времени.
+Создан для музыкантов, транскрибировщиков и всех, кто работает с аудио за компьютером.
 
 ---
 
@@ -14,7 +16,7 @@ A desktop audio player focused on real-time pitch and tempo control.
 - Real-time tempo control (25% to 200%, without affecting pitch)
 - Waveform display with seekbar
 - Track reverse
-- Export processed track to WAV
+- Export processed track to WAV or MP3
 - Loop playback
 - Drag and drop support
 - Light/dark adaptive theme
@@ -25,7 +27,7 @@ A desktop audio player focused on real-time pitch and tempo control.
 - Управление темпом в реальном времени (от 25% до 200%, без изменения тональности)
 - Отображение волновой формы с перемоткой
 - Реверс трека
-- Экспорт обработанного трека в WAV
+- Экспорт обработанного трека в WAV или MP3
 - Повтор воспроизведения
 - Поддержка drag and drop
 - Адаптивная тема оформления
@@ -40,6 +42,7 @@ A desktop audio player focused on real-time pitch and tempo control.
 - libsndfile
 - PortAudio
 - librubberband
+- libmp3lame
 
 Install Python dependencies / Установка Python зависимостей:
 
@@ -50,13 +53,13 @@ pip install -r requirements.txt
 Install system libraries on Debian/Ubuntu:
 
 ```
-sudo apt install libsndfile1-dev portaudio19-dev librubberband-dev
+sudo apt install libsndfile1-dev portaudio19-dev librubberband-dev libmp3lame-dev
 ```
 
 On Arch Linux:
 
 ```
-sudo pacman -S libsndfile portaudio rubberband
+sudo pacman -S libsndfile portaudio rubberband lame
 ```
 
 ---
@@ -124,8 +127,6 @@ retune/
 
 - Playlist / track queue
 - Loop points and markers (A-B repeat)
-- MP3 export (currently WAV only)
-- Streaming file load (currently the full file is kept in memory)
 - Keyboard shortcuts
 - Recent files list
 - Language switching from settings without restart
@@ -136,7 +137,7 @@ retune/
 
 ## Author
 
-Christopher_VN
+Christopher_VN — https://github.com/Christopher-VN
 
 ---
 
