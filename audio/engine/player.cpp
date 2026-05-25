@@ -6,11 +6,19 @@
  * player.cpp
  * ----------
  * Implementation of AudioEngine.
- * Audio data is loaded entirely into memory as interleaved float32 stereo.
- * Pitch shifting and time stretching are performed by librubberband in
- * real-time mode. PortAudio drives the output stream via a callback.
- * WAV export renders the full buffer offline through a separate stretcher
- * instance, writing to disk block by block to avoid large allocations.
+ *
+ * Thread-safety strategy:
+ *   _stretcher_mutex is taken in two situations:
+ *     1. reset_stretcher() — recreates the object (UI thread).
+ *     2. set_pitch() / set_tempo() — update stretcher parameters (UI thread).
+ *     3. process() — reads from the stretcher (audio thread).
+ *   This prevents a UI-thread reset from racing with the audio callback.
+ *
+ *   _read_pos, _playing, and _paused are std::atomic so they can be read
+ *   and written from both threads without a mutex.
+ *
+ *   _raw is written only during load() which stops playback first, so it
+ *   is effectively read-only while the audio thread is active.
  */
 
 #include "player.hpp"
@@ -30,13 +38,18 @@ AudioEngine::AudioEngine() {
 
 AudioEngine::~AudioEngine() {
     stop();
-    delete _stretcher;
+    {
+        std::lock_guard<std::mutex> lock(_stretcher_mutex);
+        delete _stretcher;
+        _stretcher = nullptr;
+    }
     Pa_Terminate();
 }
 
 // ---------- load ----------
 
 bool AudioEngine::load(const std::string& path) {
+    // Stop any active playback before touching _raw.
     stop();
 
     SF_INFO info{};
@@ -44,18 +57,16 @@ bool AudioEngine::load(const std::string& path) {
     if (!sf) return false;
 
     _sr       = info.samplerate;
-    // Cap at stereo; surround files are downmixed to the first two channels.
     _channels = info.channels > 2 ? 2 : info.channels;
     _duration = static_cast<double>(info.frames) / _sr;
 
-    // Read the entire file as interleaved float32.
     long total_samples = info.frames * info.channels;
     std::vector<float> tmp(total_samples);
     sf_read_float(sf, tmp.data(), total_samples);
     sf_close(sf);
 
     if (info.channels == 1) {
-        // Duplicate mono to both channels so the engine always works in stereo.
+        // Duplicate mono to stereo so the engine always works with two channels.
         _channels = 2;
         _raw.resize(info.frames * 2);
         for (long i = 0; i < info.frames; ++i) {
@@ -73,7 +84,6 @@ bool AudioEngine::load(const std::string& path) {
         }
     }
 
-    // Reset all state for the new file.
     _read_pos      = 0;
     _paused        = false;
     _reversed      = false;
@@ -88,8 +98,6 @@ bool AudioEngine::export_wav(const std::string& path,
                              std::function<void(float)> progress_cb) {
     if (_raw.empty()) return false;
 
-    // Open the output file before starting the render loop so we can bail
-    // early if the path is not writable.
     SF_INFO info{};
     info.samplerate = _sr;
     info.channels   = _channels;
@@ -98,23 +106,29 @@ bool AudioEngine::export_wav(const std::string& path,
     SNDFILE* sf = sf_open(path.c_str(), SFM_WRITE, &info);
     if (!sf) return false;
 
-    // Use a dedicated stretcher so export does not interfere with playback.
+    // Snapshot current parameters under the mutex so the export is consistent
+    // even if the user moves a slider while exporting.
+    double semitones, tempo_percent;
+    {
+        std::lock_guard<std::mutex> lock(_stretcher_mutex);
+        semitones     = _semitones;
+        tempo_percent = _tempo_percent;
+    }
+
+    // Use a dedicated stretcher — does not interfere with playback.
     RubberBandStretcher::Options opts =
         RubberBandStretcher::OptionProcessRealTime |
         RubberBandStretcher::OptionPitchHighConsistency;
 
     RubberBandStretcher exp_stretcher(_sr, _channels, opts);
-    exp_stretcher.setPitchScale(std::pow(2.0, _semitones / 12.0));
-    double ratio = 100.0 / std::max(1.0, _tempo_percent);
+    exp_stretcher.setPitchScale(std::pow(2.0, semitones / 12.0));
+    double ratio = 100.0 / std::max(1.0, tempo_percent);
     exp_stretcher.setTimeRatio(ratio);
 
-    // Non-interleaved input/output buffers for RubberBand.
     std::vector<std::vector<float>> in_buf(_channels, std::vector<float>(BLOCK));
     std::vector<std::vector<float>> out_buf(_channels, std::vector<float>(BLOCK));
     std::vector<float*> in_ptrs(_channels), out_ptrs(_channels);
-
-    // write_buf is resized dynamically to match whatever RubberBand returns.
-    std::vector<float> write_buf;
+    std::vector<float>  write_buf;
 
     for (int c = 0; c < _channels; ++c) {
         in_ptrs[c]  = in_buf[c].data();
@@ -124,19 +138,15 @@ bool AudioEngine::export_wav(const std::string& path,
     long total_samples = static_cast<long>(_raw.size());
     long pos = 0;
 
-    // Alternate between feeding input and draining output until exhausted.
     while (true) {
         int avail = exp_stretcher.available();
         if (avail > 0) {
-            // Resize output buffers to match what RubberBand has ready.
             write_buf.resize(avail * _channels);
             for (int c = 0; c < _channels; ++c) {
                 out_buf[c].resize(avail);
                 out_ptrs[c] = out_buf[c].data();
             }
             size_t got = exp_stretcher.retrieve(out_ptrs.data(), avail);
-
-            // Interleave non-planar output and write directly to disk.
             for (size_t f = 0; f < got; ++f)
                 for (int c = 0; c < _channels; ++c)
                     write_buf[f * _channels + c] = out_buf[c][f];
@@ -146,16 +156,12 @@ bool AudioEngine::export_wav(const std::string& path,
                 progress_cb(static_cast<float>(pos) / total_samples);
         } else {
             if (pos >= total_samples) break;
-
-            // Deinterleave the next block from _raw into per-channel buffers.
             long frames_left = (total_samples - pos) / _channels;
             long to_feed  = std::min<long>(BLOCK, frames_left);
             bool is_final = (pos + to_feed * _channels >= total_samples);
-
             for (long f = 0; f < to_feed; ++f)
                 for (int c = 0; c < _channels; ++c)
                     in_buf[c][f] = _raw[pos + f * _channels + c];
-
             exp_stretcher.process(in_ptrs.data(), to_feed, is_final);
             pos += to_feed * _channels;
         }
@@ -175,11 +181,10 @@ std::vector<float> AudioEngine::get_waveform(int n_points) const {
     long total_frames     = static_cast<long>(_raw.size()) / _channels;
     long frames_per_point = std::max(1L, total_frames / n_points);
 
-    // For each display point, find the peak amplitude across all channels.
     for (int i = 0; i < n_points; ++i) {
-        long start = i * frames_per_point;
-        long end   = std::min(start + frames_per_point, total_frames);
-        float peak = 0.f;
+        long  start = i * frames_per_point;
+        long  end   = std::min(start + frames_per_point, total_frames);
+        float peak  = 0.f;
         for (long f = start; f < end; ++f)
             for (int c = 0; c < _channels; ++c) {
                 float s = std::abs(_raw[f * _channels + c]);
@@ -188,7 +193,6 @@ std::vector<float> AudioEngine::get_waveform(int n_points) const {
         result[i] = peak;
     }
 
-    // Normalize to [0, 1] so the display is consistent across loudness levels.
     float max_peak = *std::max_element(result.begin(), result.end());
     if (max_peak > 0.f)
         for (auto& v : result) v /= max_peak;
@@ -204,8 +208,6 @@ void AudioEngine::reverse() {
     bool was_playing = _playing.load();
     stop();
 
-    // Swap frames symmetrically. Channels within each frame stay in order so
-    // left/right assignment is preserved after the reversal.
     long total_frames = static_cast<long>(_raw.size()) / _channels;
     for (long i = 0; i < total_frames / 2; ++i) {
         long j = total_frames - 1 - i;
@@ -224,6 +226,9 @@ bool AudioEngine::is_reversed() const { return _reversed; }
 // ---------- stretcher ----------
 
 void AudioEngine::reset_stretcher() {
+    // Must be called from the UI thread only (not the audio callback).
+    std::lock_guard<std::mutex> lock(_stretcher_mutex);
+
     delete _stretcher;
 
     RubberBandStretcher::Options opts =
@@ -235,7 +240,6 @@ void AudioEngine::reset_stretcher() {
     double ratio = 100.0 / std::max(1.0, _tempo_percent);
     _stretcher->setTimeRatio(ratio);
 
-    // Allocate fixed-size non-interleaved buffers for the real-time loop.
     _rb_in_buf.assign(_channels, std::vector<float>(BLOCK, 0.f));
     _rb_out_buf.assign(_channels, std::vector<float>(BLOCK, 0.f));
     _rb_in_ptrs.resize(_channels);
@@ -249,16 +253,17 @@ void AudioEngine::reset_stretcher() {
 // ---------- pitch / tempo ----------
 
 void AudioEngine::set_pitch(double semitones) {
+    // Lock so the audio callback cannot read the stretcher while we update it.
+    std::lock_guard<std::mutex> lock(_stretcher_mutex);
     _semitones = semitones;
-    // Convert semitones to a linear frequency ratio and apply immediately.
     if (_stretcher)
         _stretcher->setPitchScale(std::pow(2.0, semitones / 12.0));
 }
 
 void AudioEngine::set_tempo(double percent) {
+    std::lock_guard<std::mutex> lock(_stretcher_mutex);
     _tempo_percent = percent;
     if (_stretcher) {
-        // time_ratio > 1 slows down, < 1 speeds up.
         double ratio = 100.0 / std::max(1.0, percent);
         _stretcher->setTimeRatio(ratio);
     }
@@ -269,7 +274,6 @@ void AudioEngine::set_tempo(double percent) {
 void AudioEngine::seek(double seconds) {
     bool was_playing = _playing.load();
 
-    // Stop the stream without clearing _read_pos yet.
     if (was_playing) {
         _playing = false;
         if (_stream) {
@@ -279,13 +283,12 @@ void AudioEngine::seek(double seconds) {
         }
     }
 
-    // Clamp the target frame to the valid range.
     long target_frame = static_cast<long>(seconds * _sr);
     long total_frames = static_cast<long>(_raw.size()) / _channels;
     target_frame = std::max(0L, std::min(target_frame, total_frames - 1));
     _read_pos = target_frame * _channels;
 
-    // The stretcher must be reset after a position jump to flush its buffers.
+    // Reset the stretcher to flush its internal buffers after the position jump.
     reset_stretcher();
 
     if (was_playing) {
@@ -317,7 +320,6 @@ void AudioEngine::play() {
     if (_raw.empty()) return;
     if (_playing) return;
 
-    // Resume from the current position if paused; otherwise restart from zero.
     if (!_paused) {
         _read_pos = 0;
         reset_stretcher();
@@ -352,7 +354,7 @@ void AudioEngine::pause() {
         Pa_StopStream(_stream);
         Pa_CloseStream(_stream);
         _stream = nullptr;
-        // _read_pos is intentionally left unchanged so play() can resume here.
+        // _read_pos is intentionally preserved so play() resumes here.
     }
 }
 
@@ -394,24 +396,33 @@ int AudioEngine::pa_callback(
     void* user_data)
 {
     auto* self = static_cast<AudioEngine*>(user_data);
-    auto* out  = static_cast<float*>(output);
-    return self->process(out, frames);
+    return self->process(static_cast<float*>(output), frames);
 }
 
-// Called from the PortAudio audio thread — must be real-time safe.
+// Called from the PortAudio audio thread — must not block.
+// Acquires _stretcher_mutex briefly to access the stretcher.
 int AudioEngine::process(float* output, unsigned long frames_needed) {
     long   total_samples = static_cast<long>(_raw.size());
     size_t written       = 0;
 
     while (written < frames_needed) {
+        std::unique_lock<std::mutex> lock(_stretcher_mutex);
+
+        if (!_stretcher) {
+            // Stretcher not ready — output silence.
+            lock.unlock();
+            std::memset(output + written * _channels, 0,
+                        (frames_needed - written) * _channels * sizeof(float));
+            return paContinue;
+        }
+
         int available = static_cast<int>(_stretcher->available());
 
         if (available > 0) {
-            // Drain as many frames as we need from the stretcher output.
             size_t can_get = std::min<size_t>(available, frames_needed - written);
             _stretcher->retrieve(_rb_out_ptrs.data(), can_get);
+            lock.unlock();
 
-            // Interleave into the PortAudio output buffer.
             for (size_t f = 0; f < can_get; ++f)
                 for (int c = 0; c < _channels; ++c)
                     output[(written + f) * _channels + c] = _rb_out_buf[c][f];
@@ -420,7 +431,7 @@ int AudioEngine::process(float* output, unsigned long frames_needed) {
         } else {
             long pos = _read_pos.load();
             if (pos >= total_samples) {
-                // Buffer exhausted — fill remainder with silence and signal done.
+                lock.unlock();
                 std::memset(output + written * _channels, 0,
                             (frames_needed - written) * _channels * sizeof(float));
                 _playing = false;
@@ -428,7 +439,6 @@ int AudioEngine::process(float* output, unsigned long frames_needed) {
                 return paComplete;
             }
 
-            // Feed the next block of raw samples into the stretcher.
             long frames_left = (total_samples - pos) / _channels;
             long to_feed     = std::min<long>(BLOCK, frames_left);
             bool is_final    = (pos + to_feed * _channels >= total_samples);
@@ -438,6 +448,8 @@ int AudioEngine::process(float* output, unsigned long frames_needed) {
                     _rb_in_buf[c][f] = _raw[pos + f * _channels + c];
 
             _stretcher->process(_rb_in_ptrs.data(), to_feed, is_final);
+            lock.unlock();
+
             _read_pos += to_feed * _channels;
         }
     }
