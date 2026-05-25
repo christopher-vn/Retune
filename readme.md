@@ -1,12 +1,10 @@
 # Retune
 
 A desktop audio player focused on real-time pitch and tempo control.
-Built for musicians, transcribers, and anyone who works with audio on a computer.
 
 ---
 
 Десктопный аудиоплеер с управлением тональностью и темпом в реальном времени.
-Создан для музыкантов, транскрибировщиков и всех, кто работает с аудио за компьютером.
 
 ---
 
