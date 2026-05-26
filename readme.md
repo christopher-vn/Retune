@@ -133,14 +133,6 @@ retune/
 - Application icon
 - Distribution packaging (AppImage for Linux, installer for Windows)
 
----
-
-## Author
-
-Christopher_VN — https://github.com/Christopher-VN
-
----
-
 ## License / Лицензия
 
 MIT License
