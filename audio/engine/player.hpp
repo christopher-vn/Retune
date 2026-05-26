@@ -5,19 +5,22 @@
  *
  * player.hpp
  * ----------
- * Declaration of AudioEngine — the core C++ audio engine.
- * Handles file loading, real-time pitch shifting and time stretching
- * via librubberband, audio output via PortAudio, and WAV export
- * via libsndfile.
+ * Declaration of AudioEngine.
  *
- * Thread-safety notes:
- *   - The PortAudio callback runs on a dedicated audio thread.
- *   - All public methods may be called from the UI (main) thread.
- *   - _stretcher_mutex guards the stretcher pointer and its parameters
- *     (_semitones, _tempo_percent) so that set_pitch() / set_tempo()
- *     from the UI thread cannot race with the audio callback.
- *   - _read_pos and playback state flags use std::atomic for lock-free
- *     access from both threads.
+ * Streaming architecture:
+ *   In normal playback the file stays open via _sf / _sf_info and samples
+ *   are read block by block inside process() — _raw is NOT populated.
+ *   This keeps RSS proportional to the block size rather than file size.
+ *
+ *   _raw IS populated in two cases:
+ *     1. reverse() — the entire file is read, reversed in place, and
+ *        playback switches to in-memory mode (_streaming = false).
+ *     2. get_waveform() — a separate lightweight read pass.
+ *
+ * Thread-safety:
+ *   _stretcher_mutex guards the RubberBand stretcher and its parameters.
+ *   _sf_mutex guards the libsndfile handle and file position.
+ *   _read_pos, _playing, _paused are std::atomic.
  */
 
 #pragma once
@@ -31,6 +34,7 @@
 #include <rubberband/RubberBandStretcher.h>
 #include <portaudio.h>
 #include <sndfile.h>
+#include <lame/lame.h>
 
 class AudioEngine {
 public:
@@ -39,55 +43,37 @@ public:
     AudioEngine();
     ~AudioEngine();
 
-    // Load an audio file into memory. Returns false on failure.
     bool   load(const std::string& path);
-
-    // Start playback from the beginning (or resume after pause).
     void   play();
-
-    // Pause playback, preserving the current read position.
     void   pause();
-
-    // Stop playback and reset the read position to zero.
     void   stop();
 
-    // Set pitch shift in semitones. Thread-safe — may be called from UI thread
-    // while audio is playing.
+    // Thread-safe — may be called from the UI thread during playback.
     void   set_pitch(double semitones);
-
-    // Set playback tempo as a percentage (100 = normal speed). Thread-safe.
     void   set_tempo(double percent);
 
-    // Seek to a position given in seconds.
     void   seek(double seconds);
 
-    // Reverse the raw audio buffer in place.
+    // Loads the full file into memory, reverses it, switches to in-memory mode.
     void   reverse();
-
-    // Return true if the buffer is currently reversed.
     bool   is_reversed() const;
 
-    // Return true if audio is currently playing.
-    bool   is_playing() const;
-
-    // Return current playback position in seconds.
-    double get_position() const;
-
-    // Return total duration of the loaded file in seconds.
-    double get_duration() const;
-
-    // Return sample rate of the loaded file.
+    bool   is_playing()    const;
+    double get_position()  const;
+    double get_duration()  const;
     int    get_sample_rate() const;
 
-    // Return a downsampled peak amplitude array for waveform display.
+    // Performs a separate lightweight read pass; does not affect playback.
     std::vector<float> get_waveform(int n_points) const;
 
-    // Export the processed audio to a WAV file.
-    // progress_cb is called periodically with a value in [0, 1].
     bool   export_wav(const std::string& path,
                       std::function<void(float)> progress_cb = nullptr);
 
-    // Register a callback invoked when playback finishes naturally.
+    // Export to MP3 using libmp3lame. quality: 0 (best) to 9 (worst).
+    bool   export_mp3(const std::string& path,
+                      int quality = 2,
+                      std::function<void(float)> progress_cb = nullptr);
+
     void   set_finished_callback(FinishedCallback cb);
 
 private:
@@ -98,32 +84,40 @@ private:
                            void* user_data);
 
     int  process(float* output, unsigned long frames_needed);
-
-    // Recreate the stretcher under _stretcher_mutex.
-    // Must NOT be called from the audio thread.
     void reset_stretcher();
-
     void cleanup_stream();
+    void close_file();
 
-    // --- Audio data (written once on load, read-only after that) ---
+    // Read up to 'frames' frames from the current source into dst (non-interleaved).
+    // Returns the number of frames actually read.
+    long read_frames(long frames, std::vector<std::vector<float>>& dst);
+
+    // --- File ---
+    std::string _path;
+    SNDFILE*    _sf      = nullptr;
+    SF_INFO     _sf_info = {};
+    mutable std::mutex _sf_mutex;  // Guards _sf and file position in streaming mode
+
+    // --- In-memory buffer (used only in reversed / non-streaming mode) ---
     std::vector<float> _raw;
-    int    _channels  = 2;
-    int    _sr        = 44100;
-    double _duration  = 0.0;
+    bool               _streaming = true;  // True = read from file; False = read from _raw
 
-    // Current read position (samples, not frames). Atomic for audio thread.
+    // --- Metadata ---
+    int    _channels = 2;
+    int    _sr       = 44100;
+    double _duration = 0.0;
+    long   _total_frames = 0;  // Total frames in the file
+
+    // Current playback position in frames (streaming) or samples (in-memory).
     std::atomic<long> _read_pos{0};
 
-    // --- Processing parameters ---
-    // Guarded by _stretcher_mutex when accessed from set_pitch/set_tempo
-    // (UI thread) concurrently with process() (audio thread).
+    // --- Processing parameters (guarded by _stretcher_mutex) ---
     double _semitones     = 0.0;
     double _tempo_percent = 100.0;
 
     // --- RubberBand ---
-    // _stretcher and its parameters are protected by _stretcher_mutex.
-    mutable std::mutex                       _stretcher_mutex;
-    RubberBand::RubberBandStretcher*         _stretcher = nullptr;
+    mutable std::mutex                   _stretcher_mutex;
+    RubberBand::RubberBandStretcher*     _stretcher = nullptr;
 
     std::vector<std::vector<float>> _rb_in_buf;
     std::vector<float*>             _rb_in_ptrs;
@@ -133,12 +127,12 @@ private:
     // --- PortAudio ---
     PaStream* _stream = nullptr;
 
-    // --- State flags (atomic for cross-thread access) ---
+    // --- State ---
     std::atomic<bool> _playing{false};
     std::atomic<bool> _paused{false};
     bool              _reversed{false};
 
     FinishedCallback _finished_cb;
 
-    static constexpr int BLOCK = 512;
+    static constexpr int BLOCK = 2048;
 };

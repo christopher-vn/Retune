@@ -1,6 +1,6 @@
 /*
  * Retune — desktop audio player with real-time pitch and tempo control.
- * Copyright (c) 2026 Christopher_VN
+ * Copyright (c) 2025 Christopher_VN
  * Licensed under the MIT License.
  *
  * engine.cpp
@@ -48,5 +48,19 @@ PYBIND11_MODULE(retune_engine, m) {
             };
         return self.export_wav(path, progress_cb);
                           }, py::arg("path"), py::arg("progress_cb") = py::none())
+    .def("export_mp3", [](AudioEngine& self,
+                          const std::string& path,
+                          int quality,
+                          py::object cb) {
+        std::function<void(float)> progress_cb;
+        if (!cb.is_none())
+            progress_cb = [cb](float p) {
+                py::gil_scoped_acquire gil;
+                cb(p);
+            };
+        return self.export_mp3(path, quality, progress_cb);
+                          }, py::arg("path"),
+         py::arg("quality") = 2,
+         py::arg("progress_cb") = py::none())
     .def("set_finished_callback", &AudioEngine::set_finished_callback);
 }
