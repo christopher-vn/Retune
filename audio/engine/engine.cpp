@@ -1,6 +1,6 @@
 /*
  * Retune — desktop audio player with real-time pitch and tempo control.
- * Copyright (c) 2025 Christopher_VN
+ * Copyright (c) 2026 Christopher_VN
  * Licensed under the MIT License.
  *
  * engine.cpp
