@@ -1,4 +1,3 @@
-# Retune — desktop audio player with real-time pitch and tempo control.
 # Copyright (c) 2026 Christopher_VN
 # Licensed under the MIT License.
 #
@@ -39,7 +38,7 @@ STRINGS = {
 
         # Save dialog
         "save_dialog_title":  "Save as",
-        "save_dialog_filter": "WAV (*.wav)",
+        "save_dialog_filter": "MP3 (*.mp3);;WAV (*.wav)",
         "save_in_progress":   "Saving track...",
         "save_error":         "Could not save file.",
 
@@ -78,7 +77,7 @@ STRINGS = {
 
         # Save dialog
         "save_dialog_title":  "Сохранить как",
-        "save_dialog_filter": "WAV (*.wav)",
+        "save_dialog_filter": "MP3 (*.mp3);;WAV (*.wav)",
         "save_in_progress":   "Сохранение трека...",
         "save_error":         "Не удалось сохранить файл.",
 
