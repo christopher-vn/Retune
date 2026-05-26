@@ -96,10 +96,12 @@ class AudioPlayer(QObject):
 
     def export(self, path: str, progress_cb=None) -> bool:
         """
-        Export the processed audio to a WAV file.
+        Export the processed audio to WAV or MP3 depending on the file extension.
         progress_cb is called with a float in [0, 1] during export.
         """
         try:
+            if path.endswith(".mp3"):
+                return self._engine.export_mp3(path, 2, progress_cb)
             return self._engine.export_wav(path, progress_cb)
         except Exception as e:
             print(f"[AudioPlayer] export error: {e}", flush=True)
